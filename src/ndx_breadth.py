@@ -23,6 +23,7 @@ import yfinance as yf
 
 from constituents import resolve_nasdaq_100_symbols
 from storage import JsonParquetRepository, StockInfo, InvalidStock
+from sectors import FinnhubSectorProvider, SectorBreadthService
 
 
 MIN_HISTORY_DAYS: int = 200  # 最小200交易日
@@ -301,6 +302,37 @@ def calculate_breadth(
     )
 
 
+def print_sector_report(result: BreadthResult) -> None:
+    """打印行业宽度报告"""
+    print("\n" + "=" * 60)
+    print("📊 行业宽度指标")
+    print("=" * 60)
+
+    # 创建行业服务
+    cache_dir = Path(__file__).parent.parent / "data" / "cache" / "sectors"
+    provider = FinnhubSectorProvider(cache_dir=cache_dir)
+    service = SectorBreadthService(provider)
+
+    # 计算行业宽度
+    sector_results = service.calculate_sector_breadth(
+        symbols_above=result.symbols_above,
+        symbols_below=result.symbols_below,
+    )
+
+    # 按宽度排序显示
+    sorted_sectors = sorted(
+        sector_results.values(),
+        key=lambda x: x.breadth_pct,
+        reverse=True
+    )
+
+    for sr in sorted_sectors:
+        bar = "█" * int(sr.breadth_pct / 5)
+        print(f"{sr.sector_code:10} {sr.breadth_pct:5.1f}% {bar} ({sr.above_200ma}/{sr.total_stocks})")
+
+    print("=" * 60)
+
+
 def print_report(result: BreadthResult) -> None:
     """打印结果报告"""
     print("\n" + "=" * 60)
@@ -387,6 +419,9 @@ def main(
 
     # 3. 打印报告
     print_report(result)
+
+    # 3.5 打印行业宽度报告
+    print_sector_report(result)
 
     # 4. 保存结果（可选）
     if save:
