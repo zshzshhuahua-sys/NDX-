@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -88,8 +89,7 @@ class SectorSQLiteStorage:
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 使用同步方式初始化（aiosqlite 也支持同步调用）
-        import sqlite3
+        # 使用同步方式初始化
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.execute("""
@@ -112,8 +112,7 @@ class SectorSQLiteStorage:
             conn.close()
 
         self._init_done = True
-        import logging
-        logging.getLogger(__name__).info(f"Initialized sector storage at {self.db_path}")
+        logger.info(f"Initialized sector storage at {self.db_path}")
 
     async def initialize(self) -> None:
         """初始化数据库"""
