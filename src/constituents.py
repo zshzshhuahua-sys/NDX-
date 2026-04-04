@@ -107,6 +107,7 @@ class ConstituentsFetcher:
 
         # 2. 按优先级尝试各数据源
         providers: List[Tuple[str, callable]] = [
+            ("nasdaq_api", self._fetch_from_nasdaq_api),
             ("wikipedia", self._fetch_from_wikipedia),
             ("yahoo_finance", self._fetch_from_yahoo_finance),
         ]
@@ -173,6 +174,27 @@ class ConstituentsFetcher:
                 time.sleep(sleep_seconds)
 
         raise RuntimeError(f"{source_name} failed after {self.max_retries} retries") from last_error
+
+    def _fetch_from_nasdaq_api(self) -> List[str]:
+        """从 NASDAQ 官方 API 获取成分股（无需 API Key）"""
+        logger.info("Fetching from NASDAQ official API...")
+
+        url = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/91.0.4472.124 Safari/537.36"
+        }
+
+        response = self.session.get(url, headers=headers, timeout=self.timeout_seconds)
+        response.raise_for_status()
+
+        data = response.json()
+        rows = data.get("data", {}).get("data", {}).get("rows", [])
+
+        symbols = [stock["symbol"] for stock in rows if stock.get("symbol")]
+        logger.info(f"Found {len(symbols)} symbols from NASDAQ API")
+        return symbols
 
     def _fetch_from_wikipedia(self) -> List[str]:
         """从 Wikipedia 获取成分股"""
