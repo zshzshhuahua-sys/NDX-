@@ -2,22 +2,27 @@
 Finnhub 行业数据获取器
 
 提供 NASDAQ-100 成分股的行业分类数据
+支持异步批量获取，优化 API 调用效率
+集成 SQLite 本地存储
 """
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
+import aiohttp
 import requests
 
 from .fallback import NASDAQ100_SECTOR_MAPPING, get_fallback_sector
 from .models import NASDAQ100_SECTORS, StockSector
+from .storage import SectorSQLiteStorage
 
 
 logging.basicConfig(
@@ -26,9 +31,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 并发控制：最多同时 5 个请求
+MAX_CONCURRENT_REQUESTS = 5
+# 速率限制：每次请求间隔（秒）
+RATE_LIMIT_SECONDS = 0.5
+
 
 class FinnhubSectorProvider:
-    """从 Finnhub API 获取行业分类"""
+    """从 Finnhub API 获取行业分类（同步 + 异步接口）"""
 
     BASE_URL = "https://finnhub.io/api/v1/stock/profile2"
 
@@ -36,19 +46,22 @@ class FinnhubSectorProvider:
         self,
         api_key: Optional[str] = None,
         cache_dir: Optional[Path] = None,
-        rate_limit: float = 1.0,
+        rate_limit: float = RATE_LIMIT_SECONDS,
+        sqlite_storage: Optional[SectorSQLiteStorage] = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("FINNHUB_API_KEY")
         self.cache_dir = cache_dir
         self.rate_limit = rate_limit
+        self.sqlite_storage = sqlite_storage
         self.session = requests.Session()
         self._memory_cache: Dict[str, StockSector] = {}
         self._last_request_time: float = 0
         self._logged_fallback_warning: bool = False
+        self._logged_api_warning: bool = False
 
     def fetch(self, symbol: str) -> Optional[StockSector]:
         """
-        获取单只股票的行业分类
+        获取单只股票的行业分类（同步接口）
 
         Args:
             symbol: 股票代码
@@ -66,12 +79,9 @@ class FinnhubSectorProvider:
             self._memory_cache[symbol] = cached
             return cached
 
-        # 3. 如果没有 API Key，使用 fallback 硬编码映射
-        if not self.api_key:
-            if not self._logged_fallback_warning:
-                logger.info("FINNHUB_API_KEY not set, using fallback sector mapping")
-                self._logged_fallback_warning = True
-            fallback_data = get_fallback_sector(symbol)
+        # 3. 查询 fallback 硬编码映射
+        fallback_data = get_fallback_sector(symbol)
+        if fallback_data["sector"] != "Unknown":
             sector = StockSector(
                 symbol=symbol,
                 sector=fallback_data["sector"],
@@ -81,6 +91,14 @@ class FinnhubSectorProvider:
             self._memory_cache[symbol] = sector
             return sector
 
+        # 4. 如果没有 API Key，返回 None
+        if not self.api_key:
+            if not self._logged_fallback_warning:
+                logger.warning("FINNHUB_API_KEY not set, using fallback only")
+                self._logged_fallback_warning = True
+            return None
+
+        # 5. 请求 Finnhub API
         sector = self._request_from_api(symbol)
         if sector:
             self._memory_cache[symbol] = sector
@@ -88,9 +106,120 @@ class FinnhubSectorProvider:
 
         return sector
 
-    def fetch_batch(self, symbols: List[str]) -> Dict[str, StockSector]:
+    def fetch_batch(self, symbols: List[str]) -> Dict[str, Optional[StockSector]]:
         """
-        批量获取行业分类（带速率限制）
+        批量获取行业分类（同步接口，内部使用异步实现）
+
+        Args:
+            symbols: 股票代码列表
+
+        Returns:
+            symbol -> StockSector 的映射（未找到的返回 None）
+        """
+        # 去重
+        unique_symbols = list(set(symbols))
+
+        # 收集已缓存的结果
+        results: Dict[str, Optional[StockSector]] = {}
+        to_fetch: List[str] = []
+        sqlite_cached: List[str] = []
+
+        for symbol in unique_symbols:
+            # 1. 检查内存缓存
+            if symbol in self._memory_cache:
+                results[symbol] = self._memory_cache[symbol]
+                continue
+
+            # 2. 检查本地 JSON 缓存
+            cached = self._load_from_cache(symbol)
+            if cached:
+                self._memory_cache[symbol] = cached
+                results[symbol] = cached
+                continue
+
+            # 3. 检查 fallback
+            fallback_data = get_fallback_sector(symbol)
+            if fallback_data["sector"] != "Unknown":
+                sector = StockSector(
+                    symbol=symbol,
+                    sector=fallback_data["sector"],
+                    sector_code=fallback_data["sector_code"],
+                    industry=fallback_data["industry"],
+                )
+                self._memory_cache[symbol] = sector
+                results[symbol] = sector
+                # 保存到 SQLite
+                if self.sqlite_storage:
+                    sqlite_cached.append(symbol)
+                continue
+
+            # 4. 如果配置了 SQLite 存储，检查 SQLite
+            if self.sqlite_storage:
+                sqlite_cached.append(symbol)
+                results[symbol] = None  # 暂时设为 None，稍后从 SQLite 获取
+            else:
+                # 没有 SQLite，需要 API 请求
+                to_fetch.append(symbol)
+                results[symbol] = None
+
+        # 从 SQLite 批量获取
+        if sqlite_cached and self.sqlite_storage:
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                sqlite_results = loop.run_until_complete(
+                    self.sqlite_storage.get_batch(sqlite_cached)
+                )
+                loop.close()
+
+                for symbol, record in sqlite_results.items():
+                    if record is not None:
+                        sector = record.to_stock_sector()
+                        self._memory_cache[symbol] = sector
+                        results[symbol] = sector
+                    else:
+                        # SQLite 中也没有，需要 API 请求
+                        to_fetch.append(symbol)
+            except Exception as exc:
+                logger.warning(f"SQLite query failed: {exc}")
+                # SQLite 查询失败，尝试 API 请求
+                to_fetch.extend(sqlite_cached)
+
+        # 如果有 API 请求，使用异步批量获取
+        if to_fetch and self.api_key:
+            try:
+                # 创建新的事件循环
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                api_results = loop.run_until_complete(
+                    self._fetch_batch_async(to_fetch)
+                )
+                loop.close()
+
+                # 合并结果
+                for symbol, sector in api_results.items():
+                    results[symbol] = sector
+                    if sector:
+                        self._memory_cache[symbol] = sector
+                        self._save_to_cache(sector)
+            except Exception as exc:
+                logger.error(f"Async batch fetch failed: {exc}")
+                # Fallback 到串行请求
+                for symbol in to_fetch:
+                    if results[symbol] is None:
+                        sector = self._request_from_api(symbol)
+                        results[symbol] = sector
+                        if sector:
+                            self._memory_cache[symbol] = sector
+                            self._save_to_cache(sector)
+                        self._wait_for_rate_limit()
+
+        logger.info(f"Fetched sectors: {len([r for r in results.values() if r])}/{len(unique_symbols)} from cache/fallback, {len(to_fetch) - len([r for r in results.values() if r and r.symbol in to_fetch])}/{len(to_fetch)} from API")
+        return results
+
+    async def _fetch_batch_async(self, symbols: List[str]) -> Dict[str, Optional[StockSector]]:
+        """
+        异步批量获取行业分类（真正的并发请求）
 
         Args:
             symbols: 股票代码列表
@@ -98,25 +227,71 @@ class FinnhubSectorProvider:
         Returns:
             symbol -> StockSector 的映射
         """
-        results: Dict[str, StockSector] = {}
-        fetched: List[str] = []
+        results: Dict[str, Optional[StockSector]] = {s: None for s in symbols}
 
-        for symbol in symbols:
-            sector = self.fetch(symbol)
-            if sector:
+        # 使用信号量控制并发数
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        async def fetch_with_semaphore(symbol: str) -> tuple[str, Optional[StockSector]]:
+            async with semaphore:
+                return symbol, await self._fetch_async(symbol)
+
+        # 并发执行所有请求
+        tasks = [fetch_with_semaphore(symbol) for symbol in symbols]
+        completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 收集结果
+        for item in completed:
+            if isinstance(item, tuple):
+                symbol, sector = item
                 results[symbol] = sector
-                fetched.append(symbol)
-            else:
-                logger.warning(f"Failed to fetch sector for {symbol}")
+            elif isinstance(item, Exception):
+                logger.warning(f"Fetch error: {item}")
 
-            # 速率限制
-            self._wait_for_rate_limit()
-
-        logger.info(f"Fetched sectors for {len(fetched)}/{len(symbols)} symbols")
         return results
 
+    async def _fetch_async(self, symbol: str) -> Optional[StockSector]:
+        """异步请求单只股票的行业分类"""
+        if not self.api_key:
+            return None
+
+        url = f"{self.BASE_URL}"
+        params = {"symbol": symbol, "token": self.api_key}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=20) as response:
+                    if response.status == 429:
+                        logger.warning(f"Finnhub rate limited, waiting...")
+                        await asyncio.sleep(5)
+                        return await self._fetch_async(symbol)
+
+                    response.raise_for_status()
+                    data = await response.json()
+
+                    sector_name = data.get("finnhubIndustry") or "Unknown"
+                    sector_code = self._normalize_sector_code(sector_name)
+                    industry = data.get("industry") or "Unknown"
+
+                    return StockSector(
+                        symbol=symbol,
+                        sector=sector_name,
+                        sector_code=sector_code,
+                        industry=industry,
+                    )
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching {symbol}")
+            return None
+        except aiohttp.ClientError as exc:
+            logger.warning(f"HTTP error for {symbol}: {exc}")
+            return None
+        except (KeyError, ValueError) as exc:
+            logger.warning(f"Parse error for {symbol}: {exc}")
+            return None
+
     def _request_from_api(self, symbol: str) -> Optional[StockSector]:
-        """从 Finnhub API 请求数据"""
+        """从 Finnhub API 请求数据（同步接口）"""
         url = f"{self.BASE_URL}"
         params = {"symbol": symbol, "token": self.api_key}
 
@@ -138,7 +313,9 @@ class FinnhubSectorProvider:
             )
 
         except requests.exceptions.RequestException as exc:
-            logger.warning(f"Finnhub API error for {symbol}: {exc}")
+            if not self._logged_api_warning:
+                logger.warning(f"Finnhub API error for {symbol}: {exc}")
+                self._logged_api_warning = True
             return None
         except (KeyError, ValueError) as exc:
             logger.warning(f"Parse error for {symbol}: {exc}")
@@ -284,6 +461,18 @@ class FinnhubSectorProvider:
                 )
         except OSError as exc:
             logger.warning(f"Cache write error for {sector.symbol}: {exc}")
+
+    def clear_memory_cache(self) -> None:
+        """清空内存缓存"""
+        self._memory_cache.clear()
+        logger.debug("Memory cache cleared")
+
+    def get_cache_stats(self) -> Dict[str, int]:
+        """获取缓存统计信息"""
+        return {
+            "memory_cache_size": len(self._memory_cache),
+            "cache_dir": str(self.cache_dir) if self.cache_dir else "None",
+        }
 
 
 def get_finnhub_provider(

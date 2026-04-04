@@ -23,7 +23,7 @@ import yfinance as yf
 
 from constituents import resolve_nasdaq_100_symbols
 from storage import JsonParquetRepository, StockInfo, InvalidStock
-from sectors import FinnhubSectorProvider, SectorBreadthService
+from sectors import FinnhubSectorProvider, SectorBreadthService, SectorSQLiteStorage
 
 
 MIN_HISTORY_DAYS: int = 200  # 最小200交易日
@@ -308,9 +308,17 @@ def print_sector_report(result: BreadthResult) -> None:
     print("📊 行业宽度指标")
     print("=" * 60)
 
-    # 创建行业服务
-    cache_dir = Path(__file__).parent.parent / "data" / "cache" / "sectors"
-    provider = FinnhubSectorProvider(cache_dir=cache_dir)
+    # 创建行业服务（带 SQLite 存储）
+    data_dir = Path(__file__).parent.parent / "data"
+    cache_dir = data_dir / "cache" / "sectors"
+    sqlite_storage = SectorSQLiteStorage(
+        db_path=data_dir / "sectors.db",
+        ttl_days=7,
+    )
+    provider = FinnhubSectorProvider(
+        cache_dir=cache_dir,
+        sqlite_storage=sqlite_storage,
+    )
     service = SectorBreadthService(provider)
 
     # 计算行业宽度

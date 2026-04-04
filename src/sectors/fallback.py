@@ -141,10 +141,33 @@ NASDAQ100_SECTOR_MAPPING: Dict[str, Dict[str, str]] = {
     "PLD": {"sector": "Real Estate", "sector_code": "REIT", "industry": "REIT"},
 
     # ==================== Utilities ====================
+    "AEP": {"sector": "Utilities", "sector_code": "UTIL", "industry": "Regulated Electric"},
     "CEG": {"sector": "Utilities", "sector_code": "UTIL", "industry": "Utilities"},
     "EXC": {"sector": "Utilities", "sector_code": "UTIL", "industry": "Utilities"},
     "XEL": {"sector": "Utilities", "sector_code": "UTIL", "industry": "Utilities"},
     "WEC": {"sector": "Utilities", "sector_code": "UTIL", "industry": "Utilities"},
+
+    # ==================== 补充缺失股票 (2026-04-04) ====================
+    # ADP - Automatic Data Processing
+    "ADP": {"sector": "Technology", "sector_code": "TECH", "industry": "Software - Application"},
+    # ADSK - Autodesk
+    "ADSK": {"sector": "Technology", "sector_code": "TECH", "industry": "Software - Application"},
+    # ANET - Arista Networks
+    "ANET": {"sector": "Technology", "sector_code": "TECH", "industry": "Computer Hardware"},
+    # CMCSA - Comcast
+    "CMCSA": {"sector": "Communication Services", "sector_code": "COMMS", "industry": "Telecom Services"},
+    # LCTC - Lucid Group (原 Lucid Motors)
+    "LCTC": {"sector": "Technology", "sector_code": "TECH", "industry": "Scientific & Technical Instruments"},
+    # LU - Lufax Holding
+    "LU": {"sector": "Financials", "sector_code": "FIN", "industry": "Credit Services"},
+    # MRVL - Marvell Technology
+    "MRVL": {"sector": "Technology", "sector_code": "TECH", "industry": "Semiconductors"},
+    # PDD - PDD Holdings (Pinduoduo)
+    "PDD": {"sector": "Consumer Discretionary", "sector_code": "CONS_DISC", "industry": "Internet Retail"},
+    # PLTR - Palantir Technologies
+    "PLTR": {"sector": "Technology", "sector_code": "TECH", "industry": "Software - Infrastructure"},
+    # SMCI - Super Micro Computer
+    "SMCI": {"sector": "Technology", "sector_code": "TECH", "industry": "Computer Hardware"},
 }
 
 

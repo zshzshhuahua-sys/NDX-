@@ -60,23 +60,30 @@ class SectorBreadthService:
         Returns:
             sector_code -> SectorBreadthResult 的映射
         """
-        # 按行业分组
+        # 1. 合并并去重所有股票代码，避免重复 API 调用
+        all_stocks = symbols_above + symbols_below
+        unique_symbols = list({s.symbol for s in all_stocks})
+
+        # 2. 批量预获取所有唯一股票的行业分类
+        sector_map = self.provider.fetch_batch(unique_symbols)
+
+        # 3. 按行业分组
         sector_stocks: Dict[str, Dict[str, List[StockInfo]]] = {
             sc: {"above": [], "below": []}
             for sc in NASDAQ100_SECTORS.values()
         }
         sector_stocks["OTHER"] = {"above": [], "below": []}
 
-        # 遍历所有股票，按行业和均线上/下分组
+        # 4. 使用预获取的数据分组（无重复 API 调用）
         for stock in symbols_above:
-            sector = self.provider.fetch(stock.symbol)
+            sector = sector_map.get(stock.symbol)
             sc = sector.sector_code if sector else "OTHER"
             if sc not in sector_stocks:
                 sector_stocks[sc] = {"above": [], "below": []}
             sector_stocks[sc]["above"].append(stock)
 
         for stock in symbols_below:
-            sector = self.provider.fetch(stock.symbol)
+            sector = sector_map.get(stock.symbol)
             sc = sector.sector_code if sector else "OTHER"
             if sc not in sector_stocks:
                 sector_stocks[sc] = {"above": [], "below": []}

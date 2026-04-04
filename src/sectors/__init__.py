@@ -11,6 +11,11 @@ from .models import (
 )
 from .provider import FinnhubSectorProvider
 from .service import SectorBreadthService
+from .storage import (
+    SectorSQLiteStorage,
+    StockSectorRecord,
+    create_sector_record,
+)
 
 __all__ = [
     "NASDAQ100_SECTORS",
@@ -18,4 +23,7 @@ __all__ = [
     "SectorBreadthResult",
     "FinnhubSectorProvider",
     "SectorBreadthService",
+    "SectorSQLiteStorage",
+    "StockSectorRecord",
+    "create_sector_record",
 ]
