@@ -262,9 +262,8 @@ class FinnhubSectorProvider:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, timeout=20) as response:
                     if response.status == 429:
-                        logger.warning(f"Finnhub rate limited, waiting...")
-                        await asyncio.sleep(5)
-                        return await self._fetch_async(symbol)
+                        logger.warning(f"Finnhub rate limited for {symbol}, skipping...")
+                        return None
 
                     response.raise_for_status()
                     data = await response.json()

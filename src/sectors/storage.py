@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -79,6 +80,40 @@ class SectorSQLiteStorage:
     def _default_db_path(self) -> Path:
         """获取默认数据库路径"""
         return Path.home() / ".ndx-breadth" / "sectors.db"
+
+    def initialize_sync(self) -> None:
+        """同步初始化数据库（用于同步上下文）"""
+        if self._init_done:
+            return
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 使用同步方式初始化（aiosqlite 也支持同步调用）
+        import sqlite3
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS stock_sectors (
+                    symbol TEXT PRIMARY KEY,
+                    sector TEXT NOT NULL,
+                    sector_code TEXT NOT NULL,
+                    industry TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'fallback',
+                    fetched_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_expires_at
+                ON stock_sectors(expires_at)
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        self._init_done = True
+        import logging
+        logging.getLogger(__name__).info(f"Initialized sector storage at {self.db_path}")
 
     async def initialize(self) -> None:
         """初始化数据库"""
@@ -203,8 +238,7 @@ class SectorSQLiteStorage:
 
             # 检查是否过期
             if record.is_expired():
-                # 异步删除过期记录（不阻塞）
-                asyncio.create_task(self.delete(record.symbol))
+                results[row["symbol"]] = None
             else:
                 results[row["symbol"]] = record
 
@@ -390,9 +424,6 @@ class SectorSQLiteStorage:
         logger.info(f"Imported {len(records)} fallback sector records")
 
         return len(records)
-
-
-import asyncio
 
 
 def create_sector_record(

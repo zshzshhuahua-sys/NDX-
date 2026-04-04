@@ -315,6 +315,8 @@ def print_sector_report(result: BreadthResult) -> None:
         db_path=data_dir / "sectors.db",
         ttl_days=7,
     )
+    # 同步初始化 SQLite（必须在创建连接前调用）
+    sqlite_storage.initialize_sync()
     provider = FinnhubSectorProvider(
         cache_dir=cache_dir,
         sqlite_storage=sqlite_storage,
