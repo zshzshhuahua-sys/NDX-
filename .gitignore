@@ -17,6 +17,7 @@ htmlcov/
 # Data cache
 data/cache/
 *.json
+*.db
 
 # IDE
 .vscode/

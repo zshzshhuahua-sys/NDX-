@@ -14,14 +14,15 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import aiohttp
 import requests
 
 from .fallback import NASDAQ100_SECTOR_MAPPING, get_fallback_sector
-from .models import NASDAQ100_SECTORS, StockSector
+from .models import NASDAQ100_SECTORS, SECTOR_CODE_TO_NAME, StockSector
 from .storage import SectorSQLiteStorage
 
 
@@ -35,6 +36,15 @@ logger = logging.getLogger(__name__)
 MAX_CONCURRENT_REQUESTS = 5
 # 速率限制：每次请求间隔（秒）
 RATE_LIMIT_SECONDS = 0.5
+# 内存缓存 TTL（秒），默认 1 小时
+MEMORY_CACHE_TTL_SECONDS = 3600
+
+
+@dataclass
+class CachedStockSector:
+    """带时间戳的缓存条目"""
+    sector: StockSector
+    cached_at: float  # Unix timestamp
 
 
 class FinnhubSectorProvider:
@@ -48,35 +58,51 @@ class FinnhubSectorProvider:
         cache_dir: Optional[Path] = None,
         rate_limit: float = RATE_LIMIT_SECONDS,
         sqlite_storage: Optional[SectorSQLiteStorage] = None,
+        memory_cache_ttl: int = MEMORY_CACHE_TTL_SECONDS,
     ) -> None:
         self.api_key = api_key or os.environ.get("FINNHUB_API_KEY")
         self.cache_dir = cache_dir
         self.rate_limit = rate_limit
         self.sqlite_storage = sqlite_storage
+        self.memory_cache_ttl = memory_cache_ttl
         self.session = requests.Session()
-        self._memory_cache: Dict[str, StockSector] = {}
+        self._memory_cache: Dict[str, CachedStockSector] = {}
         self._last_request_time: float = 0
         self._logged_fallback_warning: bool = False
         self._logged_api_warning: bool = False
 
+    def _is_cache_valid(self, cached: CachedStockSector) -> bool:
+        """检查缓存是否有效（未过期）"""
+        return time.time() - cached.cached_at < self.memory_cache_ttl
+
+    def _set_cache(self, symbol: str, sector: StockSector) -> None:
+        """设置内存缓存"""
+        self._memory_cache[symbol] = CachedStockSector(
+            sector=sector,
+            cached_at=time.time()
+        )
+
+    def _get_cache(self, symbol: str) -> Optional[StockSector]:
+        """获取内存缓存（检查 TTL）"""
+        if symbol not in self._memory_cache:
+            return None
+        cached = self._memory_cache[symbol]
+        if not self._is_cache_valid(cached):
+            del self._memory_cache[symbol]
+            return None
+        return cached.sector
+
     def fetch(self, symbol: str) -> Optional[StockSector]:
-        """
-        获取单只股票的行业分类（同步接口）
-
-        Args:
-            symbol: 股票代码
-
-        Returns:
-            StockSector 或 None（如果获取失败）
-        """
-        # 1. 先查内存缓存
-        if symbol in self._memory_cache:
-            return self._memory_cache[symbol]
+        """获取单只股票的行业分类（同步接口）"""
+        # 1. 先查内存缓存（带 TTL）
+        cached = self._get_cache(symbol)
+        if cached:
+            return cached
 
         # 2. 查本地缓存
         cached = self._load_from_cache(symbol)
         if cached:
-            self._memory_cache[symbol] = cached
+            self._set_cache(symbol, cached)
             return cached
 
         # 3. 查询 fallback 硬编码映射
@@ -88,7 +114,7 @@ class FinnhubSectorProvider:
                 sector_code=fallback_data["sector_code"],
                 industry=fallback_data["industry"],
             )
-            self._memory_cache[symbol] = sector
+            self._set_cache(symbol, sector)
             return sector
 
         # 4. 如果没有 API Key，返回 None
@@ -101,39 +127,29 @@ class FinnhubSectorProvider:
         # 5. 请求 Finnhub API
         sector = self._request_from_api(symbol)
         if sector:
-            self._memory_cache[symbol] = sector
+            self._set_cache(symbol, sector)
             self._save_to_cache(sector)
 
         return sector
 
     def fetch_batch(self, symbols: List[str]) -> Dict[str, Optional[StockSector]]:
-        """
-        批量获取行业分类（同步接口，内部使用异步实现）
-
-        Args:
-            symbols: 股票代码列表
-
-        Returns:
-            symbol -> StockSector 的映射（未找到的返回 None）
-        """
-        # 去重
+        """批量获取行业分类（同步接口，内部使用异步实现）"""
         unique_symbols = list(set(symbols))
-
-        # 收集已缓存的结果
         results: Dict[str, Optional[StockSector]] = {}
         to_fetch: List[str] = []
         sqlite_cached: List[str] = []
 
         for symbol in unique_symbols:
-            # 1. 检查内存缓存
-            if symbol in self._memory_cache:
-                results[symbol] = self._memory_cache[symbol]
+            # 1. 检查内存缓存（带 TTL）
+            cached = self._get_cache(symbol)
+            if cached:
+                results[symbol] = cached
                 continue
 
             # 2. 检查本地 JSON 缓存
             cached = self._load_from_cache(symbol)
             if cached:
-                self._memory_cache[symbol] = cached
+                self._set_cache(symbol, cached)
                 results[symbol] = cached
                 continue
 
@@ -146,19 +162,17 @@ class FinnhubSectorProvider:
                     sector_code=fallback_data["sector_code"],
                     industry=fallback_data["industry"],
                 )
-                self._memory_cache[symbol] = sector
+                self._set_cache(symbol, sector)
                 results[symbol] = sector
-                # 保存到 SQLite
                 if self.sqlite_storage:
                     sqlite_cached.append(symbol)
                 continue
 
-            # 4. 如果配置了 SQLite 存储，检查 SQLite
+            # 4. 检查 SQLite
             if self.sqlite_storage:
                 sqlite_cached.append(symbol)
-                results[symbol] = None  # 暂时设为 None，稍后从 SQLite 获取
+                results[symbol] = None
             else:
-                # 没有 SQLite，需要 API 请求
                 to_fetch.append(symbol)
                 results[symbol] = None
 
@@ -175,20 +189,17 @@ class FinnhubSectorProvider:
                 for symbol, record in sqlite_results.items():
                     if record is not None:
                         sector = record.to_stock_sector()
-                        self._memory_cache[symbol] = sector
+                        self._set_cache(symbol, sector)
                         results[symbol] = sector
                     else:
-                        # SQLite 中也没有，需要 API 请求
                         to_fetch.append(symbol)
             except Exception as exc:
-                logger.warning(f"SQLite query failed: {exc}")
-                # SQLite 查询失败，尝试 API 请求
+                logger.warning("SQLite query failed: %s", exc)
                 to_fetch.extend(sqlite_cached)
 
-        # 如果有 API 请求，使用异步批量获取
+        # 异步批量获取
         if to_fetch and self.api_key:
             try:
-                # 创建新的事件循环
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 api_results = loop.run_until_complete(
@@ -196,25 +207,27 @@ class FinnhubSectorProvider:
                 )
                 loop.close()
 
-                # 合并结果
                 for symbol, sector in api_results.items():
                     results[symbol] = sector
                     if sector:
-                        self._memory_cache[symbol] = sector
+                        self._set_cache(symbol, sector)
                         self._save_to_cache(sector)
             except Exception as exc:
-                logger.error(f"Async batch fetch failed: {exc}")
-                # Fallback 到串行请求
+                logger.error("Async batch fetch failed: %s", exc)
                 for symbol in to_fetch:
                     if results[symbol] is None:
                         sector = self._request_from_api(symbol)
                         results[symbol] = sector
                         if sector:
-                            self._memory_cache[symbol] = sector
+                            self._set_cache(symbol, sector)
                             self._save_to_cache(sector)
                         self._wait_for_rate_limit()
 
-        logger.info(f"Fetched sectors: {len([r for r in results.values() if r])}/{len(unique_symbols)} from cache/fallback, {len(to_fetch) - len([r for r in results.values() if r and r.symbol in to_fetch])}/{len(to_fetch)} from API")
+        # 统计
+        cache_count = len([r for r in results.values() if r is not None])
+        logger.info("Fetched sectors: %d/%d from cache/fallback, %d from API",
+                    cache_count, len(unique_symbols), len(to_fetch))
+
         return results
 
     async def _fetch_batch_async(self, symbols: List[str]) -> Dict[str, Optional[StockSector]]:

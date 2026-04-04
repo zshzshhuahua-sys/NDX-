@@ -6,6 +6,7 @@
 
 from .models import (
     NASDAQ100_SECTORS,
+    SECTOR_CODE_TO_NAME,
     StockSector,
     SectorBreadthResult,
 )
@@ -19,6 +20,7 @@ from .storage import (
 
 __all__ = [
     "NASDAQ100_SECTORS",
+    "SECTOR_CODE_TO_NAME",
     "StockSector",
     "SectorBreadthResult",
     "FinnhubSectorProvider",

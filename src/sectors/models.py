@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List
+
+# 从 storage 导入共享的 StockInfo
+from storage.repository import StockInfo
 
 
 # NASDAQ 11个标准板块定义
@@ -23,6 +26,9 @@ NASDAQ100_SECTORS: Dict[str, str] = {
     "Utilities": "UTIL",
 }
 
+# sector_code -> sector_name 反转映射（用于快速查找）
+SECTOR_CODE_TO_NAME: Dict[str, str] = {v: k for k, v in NASDAQ100_SECTORS.items()}
+
 
 @dataclass(frozen=True)
 class StockSector:
@@ -31,15 +37,6 @@ class StockSector:
     sector: str
     sector_code: str
     industry: str
-
-
-@dataclass(frozen=True)
-class StockInfo:
-    """股票价格信息（用于行业宽度计算）"""
-    symbol: str
-    close: float
-    sma200: float
-    deviation: float
 
 
 @dataclass(frozen=True)

@@ -404,7 +404,7 @@ class SectorSQLiteStorage:
         await self.initialize()
 
         current_time = time.time()
-        expires_at = current_time + (self.ttl_days * 24 * 3600 * 30)  # 30x TTL = 永久缓存
+        expires_at = current_time + (self.ttl_days * 24 * 3600)  # 使用实例的 TTL
 
         records = [
             StockSectorRecord(

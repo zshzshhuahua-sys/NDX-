@@ -1,33 +1,37 @@
 """
 NASDAQ-100 200-Day Moving Average Breadth Indicator
-原型版本 - 使用 yfinance
 
 指标定义:
 Breadth200(t) = Count[ Close(i,t) > SMA200(i,t) ] / 有效股票数 × 100
 
-改进点 (CODEX Review):
-- 修复日期对齐问题
-- 向量化计算替代循环
-- 增大下载天数确保200交易日
-- 添加数据下载验证
-- 使用数据实际最后日期
-- 集成 JSON + Parquet 数据存储
+用法:
+    python src/ndx_breadth.py [日期] [--save] [--no-sector]
+    python src/ndx_breadth.py --help
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from logging import getLogger
 from pathlib import Path
 from typing import List, Optional
+
 import pandas as pd
 import yfinance as yf
 
-from constituents import resolve_nasdaq_100_symbols
-from storage import JsonParquetRepository, StockInfo, InvalidStock
+from constituents import HARDCODE_NASDAQ_100, resolve_nasdaq_100_symbols
 from sectors import FinnhubSectorProvider, SectorBreadthService, SectorSQLiteStorage
+from storage import JsonParquetRepository, StockInfo, InvalidStock
 
 
+# 配置常量
 MIN_HISTORY_DAYS: int = 200  # 最小200交易日
 MIN_VALID_STOCKS: int = 80   # 最低有效股票数阈值
+DEFAULT_LOOKBACK_DAYS: int = 500  # 默认回看天数
+HISTORICAL_LOOKBACK_DAYS: int = 700  # 历史查询回看天数
+TOP_STOCKS_LIMIT: int = 5  # 显示 Top N 股票
+
+# 日志配置
+logger = getLogger(__name__)
 
 
 @dataclass
@@ -60,12 +64,6 @@ def _extract_close_matrix(data: pd.DataFrame) -> pd.DataFrame:
     """
     从yfinance数据中提取Close价格矩阵
     兼容不同yfinance版本的数据格式
-
-    Args:
-        data: yfinance下载的原始数据
-
-    Returns:
-        Close价格DataFrame，列为股票代码，行为日期
     """
     # 情况1: MultiIndex (ticker, field)
     if isinstance(data.columns, pd.MultiIndex):
@@ -74,7 +72,6 @@ def _extract_close_matrix(data: pd.DataFrame) -> pd.DataFrame:
         elif 'close' in data.columns.get_level_values(1):
             result = data.xs('close', axis=1, level=1)
         else:
-            # 尝试直接通过第一层提取
             first_level = list(data.columns.get_level_values(0))
             if 'Close' in first_level:
                 result = data['Close']
@@ -83,16 +80,15 @@ def _extract_close_matrix(data: pd.DataFrame) -> pd.DataFrame:
             else:
                 raise ValueError(f"无法解析MultiIndex数据: {data.columns[:5]}")
 
-        # 清理列名：如果是元组，转为简单字符串
         if isinstance(result.columns, pd.MultiIndex):
             result.columns = [c[0] if isinstance(c, tuple) else c for c in result.columns]
         return result
 
-    # 情况2: 普通DataFrame，直接返回Close列
+    # 情况2: 普通DataFrame
     if 'Close' in data.columns:
         return data[['Close']]
 
-    # 情况3: 单列（单个股票下载）
+    # 情况3: 单列
     if len(data.columns) == 1:
         return data
 
@@ -102,24 +98,14 @@ def _extract_close_matrix(data: pd.DataFrame) -> pd.DataFrame:
 def download_stock_data(
     symbols: List[str],
     as_of_date: Optional[datetime] = None,
-    lookback_days: int = 500
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS
 ) -> pd.DataFrame:
-    """
-    下载股票历史数据
-
-    Args:
-        symbols: 股票代码列表
-        as_of_date: 计算日期 (None表示最新数据)
-        lookback_days: 回看天数
-
-    Returns:
-        DataFrame with columns for each symbol's Close
-    """
+    """下载股票历史数据"""
     end_date = as_of_date or datetime.now()
     start_date = end_date - timedelta(days=lookback_days)
 
-    print(f"📥 下载 {len(symbols)} 只股票历史数据...")
-    print(f"   日期范围: {start_date.date()} ~ {end_date.date()}")
+    logger.info("下载 %d 只股票历史数据...", len(symbols))
+    logger.debug("日期范围: %s ~ %s", start_date.date(), end_date.date())
 
     data = yf.download(
         tickers=symbols,
@@ -129,38 +115,28 @@ def download_stock_data(
         auto_adjust=True,
         threads=True,
         group_by="ticker",
-        progress=True
+        progress=False
     )
 
-    # 验证下载结果
     if data.empty:
         raise ValueError("数据下载失败: 返回空DataFrame")
 
-    # 提取Close价格矩阵（兼容不同yfinance版本）
     close_matrix = _extract_close_matrix(data)
 
-    print(f"✅ 下载完成: {close_matrix.shape[0]} 个交易日, {close_matrix.shape[1]} 只股票")
+    logger.info("下载完成: %d 个交易日, %d 只股票",
+                close_matrix.shape[0], close_matrix.shape[1])
 
-    # 检查是否有足够的交易日计算SMA200
     if close_matrix.shape[0] < MIN_HISTORY_DAYS:
         raise ValueError(
             f"数据不足: 只有 {close_matrix.shape[0]} 个交易日，"
-            f"需要至少 {MIN_HISTORY_DAYS} 个交易日计算SMA200"
+            f"需要至少 {MIN_HISTORY_DAYS} 个交易日"
         )
 
     return close_matrix
 
 
 def calculate_sma200_vectorized(close_matrix: pd.DataFrame) -> pd.DataFrame:
-    """
-    向量化计算200日均线
-
-    Args:
-        close_matrix: 列索引为symbol，行索引为date的收盘价矩阵
-
-    Returns:
-        SMA200 DataFrame
-    """
+    """向量化计算200日均线"""
     return close_matrix.rolling(
         window=MIN_HISTORY_DAYS,
         min_periods=MIN_HISTORY_DAYS
@@ -168,21 +144,9 @@ def calculate_sma200_vectorized(close_matrix: pd.DataFrame) -> pd.DataFrame:
 
 
 def _parse_date(date_str: str) -> datetime:
-    """
-    解析并验证日期字符串
-
-    Args:
-        date_str: YYYY-MM-DD 格式日期字符串
-
-    Returns:
-        datetime 对象
-
-    Raises:
-        ValueError: 日期格式无效
-    """
+    """解析并验证日期字符串"""
     try:
-        parsed = datetime.strptime(date_str, '%Y-%m-%d')
-        return parsed
+        return datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
         raise ValueError(f"无效日期格式: {date_str}，请使用 YYYY-MM-DD 格式")
 
@@ -191,35 +155,19 @@ def calculate_breadth(
     close_matrix: pd.DataFrame,
     as_of_date: Optional[str] = None
 ) -> BreadthResult:
-    """
-    计算NASDAQ-100 200日均线宽度指标
-
-    使用向量化计算，确保所有股票使用同一天的收盘价
-
-    Args:
-        close_matrix: 收盘价矩阵
-        as_of_date: 计算日期 (YYYY-MM-DD格式), None表示最新
-
-    Returns:
-        BreadthResult 对象
-
-    Raises:
-        ValueError: 日期无效或数据不足
-    """
+    """计算NASDAQ-100 200日均线宽度指标"""
     symbols: List[str] = list(close_matrix.columns)
 
-    # 解析并验证日期
+    # 解析日期
     if as_of_date is not None:
         as_of_date_str = as_of_date
-        _parse_date(as_of_date_str)  # 验证格式
+        _parse_date(as_of_date_str)
     else:
         as_of_date_str = close_matrix.index.max().strftime('%Y-%m-%d')
 
-    # 获取as_of_date的数据（向前找到最近的交易日）
-    available_dates = close_matrix.index
+    # 向前找到最近的交易日
     target_date = None
-
-    for date in reversed(available_dates):
+    for date in reversed(close_matrix.index):
         if date.strftime('%Y-%m-%d') <= as_of_date_str:
             target_date = date
             break
@@ -227,27 +175,22 @@ def calculate_breadth(
     if target_date is None:
         raise ValueError(f"没有找到 {as_of_date_str} 之前的数据")
 
-    print(f"📅 计算日期: {target_date.date()}")
+    logger.info("计算日期: %s", target_date.date())
 
-    # 提取目标日期的收盘价
+    # 提取数据
     close_at_date = close_matrix.loc[target_date]
-
-    # 计算SMA200
     sma200_matrix = calculate_sma200_vectorized(close_matrix)
-
-    # 获取目标日期的SMA200（需要至少200天数据）
     sma200_at_date = sma200_matrix.loc[target_date]
 
-    # 判断是否突破均线 (Close > SMA200)
+    # 判断突破
     above_mask = close_at_date > sma200_at_date
     valid_mask = ~sma200_at_date.isna() & ~close_at_date.isna()
 
-    # 统计
-    above_count: int = int(above_mask[valid_mask].sum())
-    valid_count: int = int(valid_mask.sum())
-    below_count: int = valid_count - above_count
+    above_count = int(above_mask[valid_mask].sum())
+    valid_count = int(valid_mask.sum())
+    below_count = valid_count - above_count
 
-    # 记录无效股票
+    # 无效股票
     symbols_invalid: List[InvalidStock] = []
     for sym in symbols:
         if pd.isna(sma200_at_date[sym]):
@@ -255,7 +198,7 @@ def calculate_breadth(
         elif pd.isna(close_at_date[sym]):
             symbols_invalid.append(InvalidStock(sym, "当日无数据"))
 
-    # 记录突破/跌破股票详情
+    # 突破/跌破详情
     symbols_above: List[StockInfo] = []
     symbols_below: List[StockInfo] = []
 
@@ -263,15 +206,15 @@ def calculate_breadth(
         if not valid_mask[sym]:
             continue
 
-        close = close_at_date[sym]
-        sma = sma200_at_date[sym]
+        close = float(close_at_date[sym])
+        sma = float(sma200_at_date[sym])
         deviation = (close - sma) / sma * 100
 
         stock_info = StockInfo(
             symbol=sym,
-            close=float(close),
-            sma200=float(sma),
-            deviation=float(deviation)
+            close=close,
+            sma200=sma,
+            deviation=deviation
         )
 
         if above_mask[sym]:
@@ -279,14 +222,13 @@ def calculate_breadth(
         else:
             symbols_below.append(stock_info)
 
-    # 计算宽度百分比
     if valid_count == 0:
         raise ValueError("没有有效股票，无法计算宽度指标")
-    breadth_pct: float = above_count / valid_count * 100
 
-    # 检查有效股票数
+    breadth_pct = above_count / valid_count * 100
+
     if valid_count < MIN_VALID_STOCKS:
-        print(f"⚠️ 警告: 有效股票数({valid_count})低于阈值({MIN_VALID_STOCKS})")
+        logger.warning("有效股票数(%d)低于阈值(%d)", valid_count, MIN_VALID_STOCKS)
 
     return BreadthResult(
         trade_date=target_date.strftime('%Y-%m-%d'),
@@ -305,40 +247,42 @@ def calculate_breadth(
 def print_sector_report(result: BreadthResult) -> None:
     """打印行业宽度报告"""
     print("\n" + "=" * 60)
-    print("📊 行业宽度指标")
+    print("行业宽度指标")
     print("=" * 60)
 
-    # 创建行业服务（带 SQLite 存储）
-    data_dir = Path(__file__).parent.parent / "data"
-    cache_dir = data_dir / "cache" / "sectors"
-    sqlite_storage = SectorSQLiteStorage(
-        db_path=data_dir / "sectors.db",
-        ttl_days=7,
-    )
-    # 同步初始化 SQLite（必须在创建连接前调用）
-    sqlite_storage.initialize_sync()
-    provider = FinnhubSectorProvider(
-        cache_dir=cache_dir,
-        sqlite_storage=sqlite_storage,
-    )
-    service = SectorBreadthService(provider)
+    try:
+        # 创建行业服务
+        data_dir = Path(__file__).parent.parent / "data"
+        cache_dir = data_dir / "cache" / "sectors"
+        sqlite_storage = SectorSQLiteStorage(
+            db_path=data_dir / "sectors.db",
+            ttl_days=7,
+        )
+        sqlite_storage.initialize_sync()
+        provider = FinnhubSectorProvider(
+            cache_dir=cache_dir,
+            sqlite_storage=sqlite_storage,
+        )
+        service = SectorBreadthService(provider)
 
-    # 计算行业宽度
-    sector_results = service.calculate_sector_breadth(
-        symbols_above=result.symbols_above,
-        symbols_below=result.symbols_below,
-    )
+        sector_results = service.calculate_sector_breadth(
+            symbols_above=result.symbols_above,
+            symbols_below=result.symbols_below,
+        )
 
-    # 按宽度排序显示
-    sorted_sectors = sorted(
-        sector_results.values(),
-        key=lambda x: x.breadth_pct,
-        reverse=True
-    )
+        sorted_sectors = sorted(
+            sector_results.values(),
+            key=lambda x: x.breadth_pct,
+            reverse=True
+        )
 
-    for sr in sorted_sectors:
-        bar = "█" * int(sr.breadth_pct / 5)
-        print(f"{sr.sector_code:10} {sr.breadth_pct:5.1f}% {bar} ({sr.above_200ma}/{sr.total_stocks})")
+        for sr in sorted_sectors:
+            bar = "#" * int(sr.breadth_pct / 5)
+            print(f"{sr.sector_code:10} {sr.breadth_pct:5.1f}% {bar} ({sr.above_200ma}/{sr.total_stocks})")
+
+    except Exception as exc:
+        logger.warning("行业报告生成失败: %s", exc)
+        print("行业报告暂时不可用")
 
     print("=" * 60)
 
@@ -346,27 +290,26 @@ def print_sector_report(result: BreadthResult) -> None:
 def print_report(result: BreadthResult) -> None:
     """打印结果报告"""
     print("\n" + "=" * 60)
-    print("📊 NASDAQ-100 200日均线宽度指标")
+    print("NASDAQ-100 200日均线宽度指标")
     print("=" * 60)
-    print(f"📅 交易日: {result.trade_date}")
-    print(f"📈 指标数值: {result.breadth_pct}")
+    print(f"交易日: {result.trade_date}")
+    print(f"指标数值: {result.breadth_pct}%")
     print("-" * 60)
-    print(f"✅ 在均线上: {result.above_200ma} 只")
-    print(f"❌ 在均线下: {result.below_200ma} 只")
-    print(f"⚠️ 无效股票: {result.invalid_stocks} 只")
-    print(f"📋 有效总数: {result.valid_stocks} / {result.total_constituents}")
+    print(f"在均线上: {result.above_200ma} 只")
+    print(f"在均线下: {result.below_200ma} 只")
+    print(f"无效股票: {result.invalid_stocks} 只")
+    print(f"有效总数: {result.valid_stocks} / {result.total_constituents}")
     print("-" * 60)
 
-    # 显示部分突破股票
     if result.symbols_above:
-        print("\n🚀 突破均线 (Top 5):")
-        sorted_above = sorted(result.symbols_above, key=lambda x: x.deviation, reverse=True)[:5]
+        print(f"\n突破均线 (Top {TOP_STOCKS_LIMIT}):")
+        sorted_above = sorted(result.symbols_above, key=lambda x: x.deviation, reverse=True)[:TOP_STOCKS_LIMIT]
         for s in sorted_above:
             print(f"   {s.symbol:6} {s.close:8.2f} / SMA200={s.sma200:8.2f} (+{s.deviation:.1f}%)")
 
     if result.symbols_below:
-        print("\n📉 跌破均线 (Bottom 5):")
-        sorted_below = sorted(result.symbols_below, key=lambda x: x.deviation)[:5]
+        print(f"\n跌破均线 (Top {TOP_STOCKS_LIMIT}):")
+        sorted_below = sorted(result.symbols_below, key=lambda x: x.deviation)[:TOP_STOCKS_LIMIT]
         for s in sorted_below:
             print(f"   {s.symbol:6} {s.close:8.2f} / SMA200={s.sma200:8.2f} ({s.deviation:.1f}%)")
 
@@ -376,64 +319,52 @@ def print_report(result: BreadthResult) -> None:
 def main(
     as_of_date: Optional[str] = None,
     save: bool = False,
+    show_sector: bool = True,
     data_dir: Optional[Path] = None,
 ) -> BreadthResult:
-    """
-    主函数
-
-    Args:
-        as_of_date: 计算日期 (YYYY-MM-DD格式), None表示最新数据
-        save: 是否保存结果到存储
-        data_dir: 数据存储目录
-
-    Returns:
-        BreadthResult 对象
-
-    Raises:
-        ValueError: 日期无效或数据不足
-    """
-    print("🚀 NASDAQ-100 200日均线宽度指标计算")
+    """主函数"""
+    print("NASDAQ-100 200日均线宽度指标计算")
     print("=" * 60)
 
-    # 0. 动态获取成分股
-    print("📋 获取NASDAQ-100成分股列表...")
+    # 动态获取成分股
+    print("获取NASDAQ-100成分股列表...")
     constituents_source = "unknown"
     try:
         symbols = resolve_nasdaq_100_symbols()
-        print(f"   ✅ 成功获取 {len(symbols)} 只成分股")
+        print(f"   成功获取 {len(symbols)} 只成分股")
         constituents_source = "nasdaq_api"
     except Exception as e:
-        print(f"   ⚠️ 动态获取失败: {e}")
-        from constituents import NASDAQ_100_FALLBACK
-        symbols = NASDAQ_100_FALLBACK
-        print(f"   🔄 使用备用列表 {len(symbols)} 只")
+        logger.warning("动态获取失败: %s", e)
+        symbols = HARDCODE_NASDAQ_100
+        print(f"   使用备用列表 {len(symbols)} 只")
         constituents_source = "fallback"
 
-    # 解析日期参数
+    # 解析日期
     if as_of_date is not None:
         parsed_date = _parse_date(as_of_date)
-        end_date = parsed_date + timedelta(days=1)  # 包含目标日期
+        end_date = parsed_date + timedelta(days=1)
     else:
         end_date = None
 
-    # 1. 下载数据（如果指定日期，需要更长的回看期）
-    lookback_days = 500 if as_of_date is None else 700  # 历史查询需要更多数据
+    # 下载数据
+    lookback_days = DEFAULT_LOOKBACK_DAYS if as_of_date is None else HISTORICAL_LOOKBACK_DAYS
     close_matrix = download_stock_data(
         symbols,
         as_of_date=end_date,
         lookback_days=lookback_days
     )
 
-    # 2. 计算宽度指标
+    # 计算宽度指标
     result = calculate_breadth(close_matrix, as_of_date)
 
-    # 3. 打印报告
+    # 打印报告
     print_report(result)
 
-    # 3.5 打印行业宽度报告
-    print_sector_report(result)
+    # 行业报告
+    if show_sector:
+        print_sector_report(result)
 
-    # 4. 保存结果（可选）
+    # 保存结果
     if save:
         if data_dir is None:
             data_dir = Path(__file__).parent.parent / "data"
@@ -451,23 +382,73 @@ def main(
             constituents_source=constituents_source,
             data_source="yfinance",
         )
-        print(f"   💾 已保存到 {data_dir}")
+        print(f"   已保存到 {data_dir}")
 
     return result
+
+
+def parse_args():
+    """解析命令行参数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="NASDAQ-100 200日均线宽度指标计算",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+    python ndx_breadth.py                      # 最新数据
+    python ndx_breadth.py 2026-03-15         # 指定日期
+    python ndx_breadth.py --save              # 保存结果
+    python ndx_breadth.py --no-sector         # 跳过行业报告
+        """
+    )
+
+    parser.add_argument(
+        'date',
+        nargs='?',
+        default=None,
+        help='计算日期 (YYYY-MM-DD格式)'
+    )
+    parser.add_argument(
+        '--save', '-s',
+        action='store_true',
+        help='保存结果到数据目录'
+    )
+    parser.add_argument(
+        '--no-sector',
+        action='store_true',
+        help='跳过行业宽度报告'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='显示详细日志'
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
     import sys
 
-    # 支持命令行参数指定日期和保存选项
-    # 用法: python ndx_breadth.py [日期] [--save]
-    date_arg: Optional[str] = None
-    save: bool = False
+    args = parse_args()
 
-    for arg in sys.argv[1:]:
-        if arg == "--save":
-            save = True
-        else:
-            date_arg = arg
+    # 配置日志
+    import logging
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        stream=sys.stdout
+    )
 
-    main(date_arg, save=save)
+    try:
+        result = main(
+            as_of_date=args.date,
+            save=args.save,
+            show_sector=not args.no_sector,
+        )
+        logger.info("计算完成")
+    except Exception as exc:
+        logger.error("执行失败: %s", exc)
+        sys.exit(1)

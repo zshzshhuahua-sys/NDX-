@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from .models import NASDAQ100_SECTORS, SectorBreadthResult, StockInfo, StockSector
+from .models import NASDAQ100_SECTORS, SECTOR_CODE_TO_NAME, SectorBreadthResult, StockInfo, StockSector
 from .provider import FinnhubSectorProvider
 
 
@@ -113,12 +113,8 @@ class SectorBreadthService:
                 key=lambda s: s.deviation,
             )[:3]
 
-            # 获取板块名称
-            sector_name = sc
-            for name, code in NASDAQ100_SECTORS.items():
-                if code == sc:
-                    sector_name = name
-                    break
+            # 获取板块名称（使用反转映射 O(1) 查找）
+            sector_name = SECTOR_CODE_TO_NAME.get(sc, sc)
 
             results[sc] = SectorBreadthResult(
                 sector=sector_name,
