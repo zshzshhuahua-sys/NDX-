@@ -11,6 +11,7 @@ Breadth200(t) = Count[ Close(i,t) > SMA200(i,t) ] / 有效股票数 × 100
 - 增大下载天数确保200交易日
 - 添加数据下载验证
 - 使用数据实际最后日期
+- 集成 JSON + Parquet 数据存储
 """
 
 from dataclasses import dataclass, field
@@ -21,26 +22,11 @@ import pandas as pd
 import yfinance as yf
 
 from constituents import resolve_nasdaq_100_symbols
+from storage import JsonParquetRepository, StockInfo, InvalidStock
 
 
 MIN_HISTORY_DAYS: int = 200  # 最小200交易日
 MIN_VALID_STOCKS: int = 80   # 最低有效股票数阈值
-
-
-@dataclass(frozen=True)
-class StockInfo:
-    """单只股票信息"""
-    symbol: str
-    close: float
-    sma200: float
-    deviation: float
-
-
-@dataclass(frozen=True)
-class InvalidStock:
-    """无效股票信息"""
-    symbol: str
-    reason: str
 
 
 @dataclass
@@ -345,12 +331,18 @@ def print_report(result: BreadthResult) -> None:
     print("=" * 60)
 
 
-def main(as_of_date: Optional[str] = None) -> BreadthResult:
+def main(
+    as_of_date: Optional[str] = None,
+    save: bool = False,
+    data_dir: Optional[Path] = None,
+) -> BreadthResult:
     """
     主函数
 
     Args:
         as_of_date: 计算日期 (YYYY-MM-DD格式), None表示最新数据
+        save: 是否保存结果到存储
+        data_dir: 数据存储目录
 
     Returns:
         BreadthResult 对象
@@ -363,14 +355,17 @@ def main(as_of_date: Optional[str] = None) -> BreadthResult:
 
     # 0. 动态获取成分股
     print("📋 获取NASDAQ-100成分股列表...")
+    constituents_source = "unknown"
     try:
         symbols = resolve_nasdaq_100_symbols()
         print(f"   ✅ 成功获取 {len(symbols)} 只成分股")
+        constituents_source = "nasdaq_api"
     except Exception as e:
         print(f"   ⚠️ 动态获取失败: {e}")
         from constituents import NASDAQ_100_FALLBACK
         symbols = NASDAQ_100_FALLBACK
         print(f"   🔄 使用备用列表 {len(symbols)} 只")
+        constituents_source = "fallback"
 
     # 解析日期参数
     if as_of_date is not None:
@@ -393,12 +388,41 @@ def main(as_of_date: Optional[str] = None) -> BreadthResult:
     # 3. 打印报告
     print_report(result)
 
+    # 4. 保存结果（可选）
+    if save:
+        if data_dir is None:
+            data_dir = Path(__file__).parent.parent / "data"
+        repo = JsonParquetRepository(data_dir)
+        repo.save(
+            trade_date=result.trade_date,
+            breadth_pct=result.breadth_pct,
+            valid_stocks=result.valid_stocks,
+            above_200ma=result.above_200ma,
+            below_200ma=result.below_200ma,
+            invalid_stocks=result.invalid_stocks,
+            symbols_above=[{"symbol": s.symbol, "close": s.close, "sma200": s.sma200, "deviation": s.deviation} for s in result.symbols_above],
+            symbols_below=[{"symbol": s.symbol, "close": s.close, "sma200": s.sma200, "deviation": s.deviation} for s in result.symbols_below],
+            symbols_invalid=[{"symbol": s.symbol, "reason": s.reason} for s in result.symbols_invalid],
+            constituents_source=constituents_source,
+            data_source="yfinance",
+        )
+        print(f"   💾 已保存到 {data_dir}")
+
     return result
 
 
 if __name__ == "__main__":
     import sys
 
-    # 支持命令行参数指定日期
-    date_arg: Optional[str] = sys.argv[1] if len(sys.argv) > 1 else None
-    main(date_arg)
+    # 支持命令行参数指定日期和保存选项
+    # 用法: python ndx_breadth.py [日期] [--save]
+    date_arg: Optional[str] = None
+    save: bool = False
+
+    for arg in sys.argv[1:]:
+        if arg == "--save":
+            save = True
+        else:
+            date_arg = arg
+
+    main(date_arg, save=save)
