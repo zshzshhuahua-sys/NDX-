@@ -105,7 +105,6 @@ def download_stock_data(
     start_date = end_date - timedelta(days=lookback_days)
 
     logger.info("下载 %d 只股票历史数据...", len(symbols))
-    logger.debug("日期范围: %s ~ %s", start_date.date(), end_date.date())
 
     data = yf.download(
         tickers=symbols,
