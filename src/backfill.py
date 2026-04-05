@@ -15,6 +15,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from constituents import HARDCODE_NASDAQ_100
 from storage import JsonParquetRepository
 from ndx_breadth import calculate_breadth, download_stock_data
 
@@ -47,24 +48,16 @@ def backfill_history(
     existing_dates = {r.trade_date for r in existing_records}
     logger.info("已有数据: %d 条", len(existing_dates))
 
-    # 生成需要计算的所有交易日
-    all_dates = []
-    current = start_date
-    while current <= end_date:
-        # 跳过周末
-        if current.weekday() < 5:
-            all_dates.append(current)
-        current += timedelta(days=1)
-
-    dates_to_calculate = [d for d in all_dates if d not in existing_dates]
+    # 生成需要计算的所有交易日 (使用 pandas 业务日范围)
+    all_dates = pd.bdate_range(start=start_date, end=end_date).tolist()
+    dates_to_calculate = [d.date() for d in all_dates if d.date() not in existing_dates]
     logger.info("需要计算: %d 天", len(dates_to_calculate))
 
     if not dates_to_calculate:
         logger.info("无需计算，已有的数据覆盖目标范围")
         return 0
 
-    # 获取成分股
-    from constituents import HARDCODE_NASDAQ_100
+    # 使用硬编码的成分股列表
     symbols = HARDCODE_NASDAQ_100
 
     # 下载完整历史数据（一次性下载，减少 API 调用）
