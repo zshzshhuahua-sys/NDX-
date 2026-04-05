@@ -125,6 +125,10 @@ class ChartDataLoader:
 
         try:
             df = pd.read_parquet(parquet_path)
+
+            # 确保 trade_date 是 datetime 类型
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+
             df = df[
                 (df["trade_date"] >= pd.to_datetime(start_date)) &
                 (df["trade_date"] <= pd.to_datetime(end_date))
@@ -132,13 +136,13 @@ class ChartDataLoader:
 
             return [
                 BreadthDataPoint(
-                    trade_date=row["trade_date"].date(),
+                    trade_date=pd.to_datetime(row["trade_date"]).date(),
                     breadth_pct=float(row["breadth_pct"]),
                     valid_stocks=int(row["valid_stocks"]),
                     above_200ma=int(row["above_200ma"]),
                     below_200ma=int(row["below_200ma"]),
                 )
-                for row in df.itertuples(index=False)
+                for _, row in df.iterrows()
             ]
         except Exception as exc:
             logger.error("Failed to load breadth history: %s", exc)
@@ -163,16 +167,30 @@ class ChartDataLoader:
                 logger.warning("No NDX data returned")
                 return []
 
-            # 处理 MultiIndex 列
+            # 处理 MultiIndex 列 (新版本 yfinance)
             if isinstance(ndx.columns, pd.MultiIndex):
-                close_col = "Close" if "Close" in ndx.columns.get_level_values(1) else "close"
-                closes = ndx.xs(close_col, axis=1, level=1)
+                # 尝试获取 Close 列
+                if "Close" in ndx.columns.get_level_values(1):
+                    closes = ndx.xs("Close", axis=1, level=1)
+                elif "close" in ndx.columns.get_level_values(1):
+                    closes = ndx.xs("close", axis=1, level=1)
+                else:
+                    # 使用第一个列作为 Close
+                    closes = ndx.iloc[:, 0]
             else:
-                closes = ndx["Close"] if "Close" in ndx.columns else ndx["close"]
+                # 普通 DataFrame
+                cols = ndx.columns.tolist()
+                close_names = ["Close", "close", "adj close", "Adj Close"]
+                for name in close_names:
+                    if name in cols:
+                        closes = ndx[name]
+                        break
+                else:
+                    closes = ndx.iloc[:, 0]
 
             return [
                 NDXDataPoint(
-                    trade_date=idx.date(),
+                    trade_date=idx.date() if hasattr(idx, 'date') else idx,
                     close=float(close),
                 )
                 for idx, close in closes.items()
