@@ -14,8 +14,6 @@ from plotly.subplots import make_subplots
 
 from .chart_config import COLORS, LAYOUT_CONFIG, SECTOR_COLORS
 from .data_loader import BreadthDataPoint, ChartData, NDXDataPoint, SectorDataPoint
-from .main_chart import create_main_chart
-from .sector_chart import create_sector_chart
 
 
 def create_combined_chart(
@@ -190,7 +188,7 @@ def create_combined_chart(
 def save_chart(
     fig: go.Figure,
     output_path: Union[str, Path],
-    format: str = "png",
+    output_format: str = "png",
 ) -> Path:
     """
     保存图表到文件
@@ -198,7 +196,7 @@ def save_chart(
     Args:
         fig: Plotly Figure 对象
         output_path: 输出文件路径
-        format: 输出格式 (png/html/svg)
+        output_format: 输出格式 (png/html/svg)
 
     Returns:
         输出文件路径
@@ -206,18 +204,18 @@ def save_chart(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if format == "html":
+    if output_format == "html":
         fig.write_html(output_path)
-    elif format in ("png", "jpg", "webp"):
+    elif output_format in ("png", "jpg", "webp"):
         # 需要 kaleido 进行静态导出
         try:
-            fig.write_image(output_path, format=format)
+            fig.write_image(output_path, format=output_format)
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to export {format}. "
+                f"Failed to export {output_format}. "
                 "Install kaleido: pip install kaleido"
             ) from exc
     else:
-        raise ValueError(f"Unsupported format: {format}")
+        raise ValueError(f"Unsupported format: {output_format}")
 
     return output_path

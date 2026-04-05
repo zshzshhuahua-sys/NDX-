@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from logging import getLogger
@@ -198,7 +199,6 @@ class ChartDataLoader:
             return []
 
         try:
-            import json
             with open(json_path) as f:
                 data = json.load(f)
 
